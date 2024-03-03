@@ -87,7 +87,7 @@ static char* gpiosEcrireNoms[] = {"OUT1", "OUT2", "OUT3", "OUT4"};
 #endif
 
 // Les patrons de balayage (une seule ligne doit être active à la fois)
-static int   patronsBalayage[NOMBRE_LIGNES][NOMBRE_LIGNES] = {
+static int patronsBalayage[NOMBRE_LIGNES][NOMBRE_LIGNES] = {
         {1, 0, 0, 0},
         {0, 1, 0, 0},
         {0, 0, 1, 0},
@@ -121,13 +121,17 @@ static unsigned int pausePollingMs = 20;
 module_param(pausePollingMs, uint, S_IRUGO);
 MODULE_PARM_DESC(pausePollingMs, " Duree de la pause apres chaque polling (en ms, 20ms par defaut)");
 
-
+static unsigned int dureeDebounce = 50;
 
 static int pollClavier(void *arg){
     // Cette fonction contient la boucle principale du thread détectant une pression sur une touche
-    int patternIdx, ligneIdx, colIdx, val;
+    // int patternIdx, ligneIdx, colIdx, val; // warning: unused variable 'patternIdx'
+    int ligneIdx, colIdx, val;
     printk(KERN_INFO "SETR_CLAVIER : Poll clavier declenche! \n");
     while(!kthread_should_stop()){           // Permet de s'arrêter en douceur lorsque kthread_stop() sera appelé
+      //
+      char readValues[16];
+      int nbReadValues;
       set_current_state(TASK_RUNNING);      // On indique qu'on est en train de faire quelque chose
 
       // TODO
@@ -137,6 +141,36 @@ static int pollClavier(void *arg){
       // 3) Selon ces valeurs et le contenu de dernierEtat, déterminer si une nouvelle touche a été pressée
       // 4) Mettre à jour le buffer et dernierEtat en vous assurant d'éviter les race conditions avec le reste du module
 
+      nbReadValues = 0;
+      for (ligneIdx = 0; ligneIdx < sizeof(gpiosEcrire)/sizeof(int); ligneIdx++) {
+        gpio_set_value(gpiosEcrire[0], patronsBalayage[ligneIdx][0]);
+        gpio_set_value(gpiosEcrire[1], patronsBalayage[ligneIdx][1]);
+        gpio_set_value(gpiosEcrire[2], patronsBalayage[ligneIdx][2]);
+        gpio_set_value(gpiosEcrire[3], patronsBalayage[ligneIdx][3]);
+        for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
+            val = gpio_get_value(gpiosLire[colIdx]);
+            if (val && dernierEtat[ligneIdx][colIdx] == 0) {
+                readValues[nbReadValues] = valeursClavier[ligneIdx][colIdx];
+                nbReadValues++;
+            }
+            if (val != dernierEtat[ligneIdx][colIdx]) {
+                dernierEtat[ligneIdx][colIdx] = val;
+            }
+        }
+        // gpio_set_value(gpiosEcrire[ligneIdx], 0);
+      }
+
+// raison du 3 touches
+// https://www.groovypost.com/explainer/what-is-keyboard-ghosting-and-how-to-stop-it/ 
+      if (nbReadValues < 3) {
+        int i;
+        mutex_lock(&sync);
+        for (i = 0; i < nbReadValues; i++) {
+            data[posCouranteEcriture] = readValues[i];
+            posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
+        }
+        mutex_unlock(&sync);
+      }
 
       set_current_state(TASK_INTERRUPTIBLE); // On indique qu'on peut ere interrompu
       msleep(pausePollingMs);                // On se met en pause un certain temps
@@ -147,7 +181,8 @@ static int pollClavier(void *arg){
 
 
 static int __init setrclavier_init(void){
-    int i, ok;
+    // int i, ok; // warning: unused variable 'ok'
+    int i;
     printk(KERN_INFO "SETR_CLAVIER : Initialisation du driver commencee\n");
 
     // On enregistre notre pilote
@@ -181,7 +216,14 @@ static int __init setrclavier_init(void){
     //
     // Vous devez également initialiser le mutex de synchronisation.
 
-
+    for (i = 0; i < sizeof(gpiosEcrire)/sizeof(int); i++) {
+        gpio_request_one(gpiosEcrire[i], GPIOF_OUT_INIT_LOW, gpiosEcrireNoms[i]);
+    }
+    for (i = 0; i < sizeof(gpiosLire)/sizeof(int); i++) {
+        gpio_request_one(gpiosLire[i], GPIOF_IN, gpiosLireNoms[i]);
+        gpio_set_debounce(gpiosLire[i], dureeDebounce);
+    }
+    mutex_init(&sync);
 
     // Le mutex devrait avoir été initialisé avant d'appeler la ligne suivante!
     task = kthread_run(pollClavier, NULL, "Thread_polling_clavier");
@@ -201,6 +243,13 @@ static void __exit setrclavier_exit(void){
     // TODO
     // Écrivez le code permettant de relâcher (libérer) les GPIO
     // Vous aurez pour cela besoin de la fonction gpio_free
+
+    for (i = 0; i < sizeof(gpiosEcrire)/sizeof(int); i++) {
+        gpio_free(gpiosEcrire[i]);
+    }
+    for (i = 0; i < sizeof(gpiosLire)/sizeof(int); i++) {
+        gpio_free(gpiosLire[i]);
+    }
 
     // On retire correctement les différentes composantes du pilote
     device_destroy(setrClasse, MKDEV(majorNumber, 0));
@@ -239,6 +288,41 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // posCouranteLecture, et vous devez gérer ce cas sans perdre de caractères et en respectant les
     // autres conditions (par exemple, ne jamais copier plus que len caractères).
 
+    int availableBytes, bytes2Write, i, index;
+    long err;
+    char copyBuffer[20]; // valeur max de bytes2write
+
+    mutex_lock(&sync);
+
+    availableBytes = 0;
+    if (posCouranteEcriture < posCouranteLecture) {
+        availableBytes = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
+    }
+    else {
+        availableBytes = posCouranteEcriture - posCouranteLecture;
+    }
+
+    bytes2Write = 0;
+    if (availableBytes < len) {
+        bytes2Write = availableBytes;
+    }
+    else {
+        bytes2Write = len;
+    }
+
+    for (i = 0; i < bytes2Write; i++) {
+        index = (posCouranteLecture + i) % TAILLE_BUFFER;
+        copyBuffer[i] = data[index];
+    }
+    posCouranteLecture = (posCouranteLecture + bytes2Write) % TAILLE_BUFFER;
+
+    err = copy_to_user(buffer, copyBuffer, bytes2Write);
+    if (err) {
+        printk(KERN_INFO "SETR_CLAVIER: Error during copy_to_user \n");
+    }
+
+    mutex_unlock(&sync);
+    return bytes2Write;
 }
 
 // On enregistre les fonctions d'initialisation et de destruction
