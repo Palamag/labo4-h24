@@ -131,6 +131,9 @@ void func_tasklet_polling(unsigned long paramf){
     // Une différence majeure est que ce tasklet ne contient pas de boucle,
     // il ne s'exécute qu'une seule fois par interruption!
     int patternIdx, ligneIdx, colIdx, val;
+    char readValues[16];
+    int nbReadValues;
+    int current_line;
 
     // TODO
     // Écrivez le code permettant
@@ -145,6 +148,48 @@ void func_tasklet_polling(unsigned long paramf){
     // 5) Mettre à jour le buffer et dernierEtat en vous assurant d'éviter les race conditions avec le reste du module
     // 6) Remettre toutes les lignes à 1 (pour réarmer l'interruption)
     // 7) Réactiver le traitement des interruptions
+
+    atomic_set(&irqActif, 0);
+    for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
+        disable_irq(irqId[colIdx]);
+    }
+
+    nbReadValues = 0;
+    for (ligneIdx = 0; ligneIdx < sizeof(gpiosEcrire)/sizeof(int); ligneIdx++) {
+        gpio_set_value(gpiosEcrire[0], patronsBalayage[ligneIdx][0]);
+        gpio_set_value(gpiosEcrire[1], patronsBalayage[ligneIdx][1]);
+        gpio_set_value(gpiosEcrire[2], patronsBalayage[ligneIdx][2]);
+        gpio_set_value(gpiosEcrire[3], patronsBalayage[ligneIdx][3]);
+        for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
+            val = gpio_get_value(gpiosLire[colIdx]);
+            if (val && dernierEtat[ligneIdx][colIdx] == 0) {
+                readValues[nbReadValues] = valeursClavier[ligneIdx][colIdx];
+                nbReadValues++;
+            }
+            if (val != dernierEtat[ligneIdx][colIdx]) {
+                dernierEtat[ligneIdx][colIdx] = val;
+            }
+        }
+    }
+
+    if (nbReadValues < 3) {
+        int i;
+        mutex_lock(&sync);
+        for (i = 0; i < nbReadValues; i++) {
+            data[posCouranteEcriture] = readValues[i];
+            posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
+        }
+        mutex_unlock(&sync);
+    }
+
+    for (ligneIdx = 0; ligneIdx < sizeof(gpiosEcrire)/sizeof(int); ligneIdx++) {
+        gpio_set_value(gpiosEcrire[ligneIdx], 1);
+    }
+
+    for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
+        enable_irq(irqId[colIdx]);
+    }
+    atomic_set(&irqActif, 1);
 
 }
 
@@ -162,6 +207,12 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // Voyez les commentaires du tasklet pour une piste potentielle de synchronisation.
     // Le seul travail de cette IRQ est de céduler un tasklet qui fera le travail
     // TODO
+
+    if (irqActif)
+    {
+        tasklet_schedule(&tasklet_polling);
+    }
+    
 
     // On retourne en indiquant qu'on a géré l'interruption
     return (irqreturn_t) IRQ_HANDLED;
