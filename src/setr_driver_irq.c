@@ -149,9 +149,11 @@ void func_tasklet_polling(unsigned long paramf){
     // 7) Réactiver le traitement des interruptions
 
     atomic_set(&irqActif, 0);
-    for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
+    /*for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
         disable_irq(irqId[colIdx]);
-    }
+    }*/
+
+    printk(KERN_INFO "IN THE IRQ\n");
 
     nbReadValues = 0;
     for (ligneIdx = 0; ligneIdx < sizeof(gpiosEcrire)/sizeof(int); ligneIdx++) {
@@ -185,9 +187,11 @@ void func_tasklet_polling(unsigned long paramf){
         gpio_set_value(gpiosEcrire[ligneIdx], 1);
     }
 
-    for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
+    printk(KERN_INFO "OUT THE IRQ\n");    
+
+    /*for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
         enable_irq(irqId[colIdx]);
-    }
+    }*/
     atomic_set(&irqActif, 1);
 
 }
@@ -207,14 +211,11 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // Le seul travail de cette IRQ est de céduler un tasklet qui fera le travail
     // TODO
 
-    printk(KERN_INFO "IN THE IRQ\n");
 
     if (atomic_read(&irqActif) == 1)
     {
         tasklet_schedule(&tasklet_polling);
     }
-
-    printk(KERN_INFO "OUT THE IRQ\n");    
 
     // On retourne en indiquant qu'on a géré l'interruption
     return (irqreturn_t) IRQ_HANDLED;
@@ -265,13 +266,11 @@ static int __init setrclavier_init(void){
 
     for (size_t i = 0; i < sizeof(gpiosEcrire)/sizeof(int); i++)
     {
-        gpio_request_one(gpiosEcrire[i], GPIOF_OUT_INIT_LOW, gpiosEcrireNoms[i]);
-        gpio_set_value(gpiosEcrire[i], 1);
-
+        gpio_request_one(gpiosEcrire[i], GPIOF_OUT_INIT_HIGH | GPIOF_OPEN_DRAIN, gpiosEcrireNoms[i]);
     }
     for (i = 0; i < sizeof(gpiosLire)/sizeof(int); i++) {
         gpio_request_one(gpiosLire[i], GPIOF_IN, gpiosLireNoms[i]);
-        gpio_set_debounce(gpiosLire[i], dureeDebounce);
+        // gpio_set_debounce(gpiosLire[i], dureeDebounce);
     }
 
     for (size_t i = 0; i < NOMBRE_COLONNES; i++)
@@ -367,15 +366,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
         availableBytes = posCouranteEcriture - posCouranteLecture;
     }
 
-    bytes2Write = 0;
-
-    if (availableBytes < len)
-    {
-        bytes2Write = availableBytes;
-    }
-    else {
-        bytes2Write = len;
-    }
+    bytes2Write = min((int) len, availableBytes);
 
     for (i = 0; i < bytes2Write; i++) {
         index = (posCouranteLecture + i) % TAILLE_BUFFER;
