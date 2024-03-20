@@ -32,7 +32,7 @@
 #include <linux/atomic.h>           // Synchronisation par valeur atomique
 
 // Le nom de notre périphérique et le nom de sa classe
-#define DEV_NAME "claviersetr"
+#define DEV_NAME "setrclavier"
 #define CLS_NAME "setr"
 
 // Le nombre de caractères pouvant être contenus dans le buffer circulaire
@@ -118,7 +118,7 @@ static int   patronsBalayage[NOMBRE_LIGNES][NOMBRE_LIGNES] = {
 // pour ne pas répéter une touche qui était déjà enfoncée.
 static int dernierEtat[NOMBRE_LIGNES][NOMBRE_COLONNES] = {0};
 
-
+static unsigned int dureeDebounce = 50;
 
 
 
@@ -130,10 +130,9 @@ void func_tasklet_polling(unsigned long paramf){
     // touche est pressée.
     // Une différence majeure est que ce tasklet ne contient pas de boucle,
     // il ne s'exécute qu'une seule fois par interruption!
-    int patternIdx, ligneIdx, colIdx, val;
+    int ligneIdx, colIdx, val;
     char readValues[16];
     int nbReadValues;
-    int current_line;
 
     // TODO
     // Écrivez le code permettant
@@ -208,11 +207,14 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // Le seul travail de cette IRQ est de céduler un tasklet qui fera le travail
     // TODO
 
-    if (irqActif)
+    printk(KERN_INFO "IN THE IRQ\n");
+
+    if (atomic_read(&irqActif) == 1)
     {
         tasklet_schedule(&tasklet_polling);
     }
-    
+
+    printk(KERN_INFO "OUT THE IRQ\n");    
 
     // On retourne en indiquant qu'on a géré l'interruption
     return (irqreturn_t) IRQ_HANDLED;
@@ -261,16 +263,31 @@ static int __init setrclavier_init(void){
     //
     // Vous devez également initialiser le mutex de synchronisation.
 
-    ok = request_irq(irqno,                 // Le numéro de l'interruption, obtenue avec gpio_to_irq
-         (irq_handler_t) setr_irq_handler,  // Pointeur vers la routine de traitement de l'interruption
-         IRQF_TRIGGER_RISING,               // On veut une interruption sur le front montant (lorsque le bouton est pressé)
-         "setr_irq_handler",                // Le nom de notre interruption
-         NULL);                             // Paramètre supplémentaire inutile pour vous
-    if(ok != 0)
-        printk(KERN_ALERT "Erreur (%d) lors de l'enregistrement IRQ #{%d}!\n", ok, irqno);
+    for (size_t i = 0; i < sizeof(gpiosEcrire)/sizeof(int); i++)
+    {
+        gpio_request_one(gpiosEcrire[i], GPIOF_OUT_INIT_LOW, gpiosEcrireNoms[i]);
+        gpio_set_value(gpiosEcrire[i], 1);
 
+    }
+    for (i = 0; i < sizeof(gpiosLire)/sizeof(int); i++) {
+        gpio_request_one(gpiosLire[i], GPIOF_IN, gpiosLireNoms[i]);
+        gpio_set_debounce(gpiosLire[i], dureeDebounce);
+    }
 
-        printk(KERN_INFO "SETR_CLAVIER_IRQ : Fin de l'Initialisation!\n"); // Made it! device was initialized
+    for (size_t i = 0; i < NOMBRE_COLONNES; i++)
+    {
+        irqId[i] = gpio_to_irq(gpiosLire[i]);
+        ok = request_irq(irqId[i],             // Le numéro de l'interruption, obtenue avec gpio_to_irq
+            (irq_handler_t) setr_irq_handler,  // Pointeur vers la routine de traitement de l'interruption
+            IRQF_TRIGGER_RISING,               // On veut une interruption sur le front montant (lorsque le bouton est pressé)
+            "setr_irq_handler",                // Le nom de notre interruption
+            NULL);                             // Paramètre supplémentaire inutile pour vous
+        if(ok != 0)
+            printk(KERN_ALERT "Erreur (%d) lors de l'enregistrement IRQ #{%d}!\n", ok, irqId[i]);
+    }
+
+    mutex_init(&sync);
+    printk(KERN_INFO "SETR_CLAVIER_IRQ : Fin de l'Initialisation!\n"); // Made it! device was initialized
 
     return 0;
 }
@@ -284,6 +301,14 @@ static void __exit setrclavier_exit(void){
     // Vous aurez pour cela besoin de la fonction gpio_free
     // Vous devrez également relâcher les interruptions qui ont été
     // précédemment enregistrées. Utilisez free_irq(irqno, NULL)
+
+    for (i = 0; i < sizeof(gpiosEcrire)/sizeof(int); i++) {
+        gpio_free(gpiosEcrire[i]);
+    }
+    for (i = 0; i < sizeof(gpiosLire)/sizeof(int); i++) {
+        free_irq(irqId[i], NULL);
+        gpio_free(gpiosLire[i]);
+    }
 
     // On retire correctement les différentes composantes du pilote
     device_destroy(setrClasse, MKDEV(majorNumber, 0));
@@ -326,6 +351,45 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // revienne alors à 0. Il est donc tout à fait possible que posCouranteEcriture soit INFÉRIEUR à
     // posCouranteLecture, et vous devez gérer ce cas sans perdre de caractères et en respectant les
     // autres conditions (par exemple, ne jamais copier plus que len caractères).
+
+    int availableBytes, bytes2Write, i, index;
+    long err;
+    char copyBuffer[20];
+
+    mutex_lock(&sync);
+
+    availableBytes = 0;
+    if (posCouranteEcriture < posCouranteLecture)
+    {
+        availableBytes = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
+    }
+    else {
+        availableBytes = posCouranteEcriture - posCouranteLecture;
+    }
+
+    bytes2Write = 0;
+
+    if (availableBytes < len)
+    {
+        bytes2Write = availableBytes;
+    }
+    else {
+        bytes2Write = len;
+    }
+
+    for (i = 0; i < bytes2Write; i++) {
+        index = (posCouranteLecture + i) % TAILLE_BUFFER;
+        copyBuffer[i] = data[index];
+    }
+    posCouranteLecture = (posCouranteLecture + bytes2Write) % TAILLE_BUFFER;
+
+    err = copy_to_user(buffer, copyBuffer, bytes2Write);
+    if (err) {
+        printk(KERN_INFO "SETR_CLAVIER: Error during copy_to_user \n");
+    }
+
+    mutex_unlock(&sync);
+    return bytes2Write;
 }
 
 
@@ -335,6 +399,6 @@ module_exit(setrclavier_exit);
 
 // Description du module
 MODULE_LICENSE("GPL");            // Licence : laissez "GPL"
-MODULE_AUTHOR("Vous!");           // Vos noms
+MODULE_AUTHOR("David Duchesne, Mathieu Faucher, Xavier Hamel");           // Vos noms
 MODULE_DESCRIPTION("Lecteur de clavier externe, avec interruptions");  // Description du module
 MODULE_VERSION("0.4");            // Numéro de version
