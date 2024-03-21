@@ -30,6 +30,7 @@
 #include <linux/mutex.h>            // Mutex et synchronisation
 #include <linux/interrupt.h>        // Définit les symboles pour les interruptions et les tasklets
 #include <linux/atomic.h>           // Synchronisation par valeur atomique
+#include <linux/timekeeping.h>
 
 // Le nom de notre périphérique et le nom de sa classe
 #define DEV_NAME "setrclavier"
@@ -71,6 +72,7 @@ static struct device* setrDevice = NULL;    // Contiendra les informations sur l
 
 static struct mutex sync;                   // Mutex servant à synchroniser les accès au buffer
 static atomic_t irqActif = ATOMIC_INIT(1);  // Pour déterminer si les interruptions doivent être traitées
+unsigned long long irqPeriod = 0;
 
 
 // 4 GPIO doivent être assignés pour l'écriture, et 3 ou 4 en lecture (voir énoncé)
@@ -120,9 +122,10 @@ static int dernierEtat[NOMBRE_LIGNES][NOMBRE_COLONNES] = {0};
 
 static unsigned int dureeDebounce = 50;
 
-
-
 void func_tasklet_polling(unsigned long paramf){
+    int ligneIdx, colIdx, val;
+    char readValues[16];
+    int nbReadValues;
     // Cette fonction est le coeur d'exécution du tasklet
     // Elle fait à peu de choses près la même chose que le kthread
     // dans le pilote que vous avez précédemment écrit (par polling),
@@ -130,9 +133,7 @@ void func_tasklet_polling(unsigned long paramf){
     // touche est pressée.
     // Une différence majeure est que ce tasklet ne contient pas de boucle,
     // il ne s'exécute qu'une seule fois par interruption!
-    int ligneIdx, colIdx, val;
-    char readValues[16];
-    int nbReadValues;
+    atomic_set(&irqActif, 0);
 
     // TODO
     // Écrivez le code permettant
@@ -148,14 +149,11 @@ void func_tasklet_polling(unsigned long paramf){
     // 6) Remettre toutes les lignes à 1 (pour réarmer l'interruption)
     // 7) Réactiver le traitement des interruptions
 
-    atomic_set(&irqActif, 0);
     /*for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
         disable_irq(irqId[colIdx]);
     }*/
-
-    printk(KERN_INFO "IN THE IRQ\n");
-
     nbReadValues = 0;
+    mdelay(dureeDebounce);
     for (ligneIdx = 0; ligneIdx < sizeof(gpiosEcrire)/sizeof(int); ligneIdx++) {
         gpio_set_value(gpiosEcrire[0], patronsBalayage[ligneIdx][0]);
         gpio_set_value(gpiosEcrire[1], patronsBalayage[ligneIdx][1]);
@@ -187,11 +185,11 @@ void func_tasklet_polling(unsigned long paramf){
         gpio_set_value(gpiosEcrire[ligneIdx], 1);
     }
 
-    printk(KERN_INFO "OUT THE IRQ\n");    
-
     /*for (colIdx = 0; colIdx < sizeof(gpiosLire)/sizeof(int); colIdx++) {
         enable_irq(irqId[colIdx]);
     }*/
+
+    irqPeriod = ktime_get_ns();
     atomic_set(&irqActif, 1);
 
 }
@@ -212,7 +210,7 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // TODO
 
 
-    if (atomic_read(&irqActif) == 1)
+    if (atomic_read(&irqActif) == 1 && (ktime_get_ns() - irqPeriod > 50000000))//50000000 ns = 50 ms
     {
         tasklet_schedule(&tasklet_polling);
     }
